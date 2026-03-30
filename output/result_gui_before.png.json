@@ -1,0 +1,11 @@
+{
+  "image_path": "docs\\gui_before.png",
+  "faces_detected": 0,
+  "face_predictions": [],
+  "overall_prediction": 0.2572987169027328,
+  "is_fake": false,
+  "detection_time": 0.824493408203125,
+  "image_prediction": 0.36756959557533264,
+  "frequency_prediction": 0.0,
+  "report_path": "D:\\Project Work\\deepfake_detector-main\\deepfake_detector-main\\output\\gui_before_report_20260330_175703.png"
+}
