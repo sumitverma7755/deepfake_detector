@@ -13,7 +13,7 @@ import tensorflow as tf
 
 from config.settings import ENABLE_DIRECTML, MODELS_DIR
 from core.types import DetectionResult
-from utils.preprocessing import extract_faces, extract_frequency_features
+from utils.preprocessing import extract_faces, extract_frames, extract_frequency_features
 
 try:  # Optional GPU backend on native Windows
     import onnxruntime as ort
@@ -249,28 +249,6 @@ class InferenceService:
 
         return normalized.astype(np.float32)
 
-    def _probability_from_prediction(self, prediction: np.ndarray) -> float:
-        raw = np.asarray(prediction, dtype=np.float32).reshape(-1)
-        if raw.size == 0:
-            return 0.5
-
-        if raw.size == 1:
-            value = float(raw[0])
-            if value < 0.0 or value > 1.0:
-                value = float(1.0 / (1.0 + np.exp(-value)))
-            return float(np.clip(value, 0.0, 1.0))
-
-        if np.any(raw < 0) or not np.isclose(float(raw.sum()), 1.0, atol=1e-2):
-            logits = raw - np.max(raw)
-            probs = np.exp(logits)
-            probs = probs / np.sum(probs)
-        else:
-            probs = raw
-
-        if probs.size >= 2:
-            return float(np.clip(probs[1], 0.0, 1.0))
-        return float(np.clip(np.max(probs), 0.0, 1.0))
-
     def _predict_probabilities(self, batch: np.ndarray) -> np.ndarray:
         batch = np.asarray(batch, dtype=np.float32)
 
@@ -284,9 +262,39 @@ class InferenceService:
 
         if predictions.ndim == 1:
             predictions = predictions[:, np.newaxis]
+        elif predictions.ndim > 2:
+            predictions = predictions.reshape(predictions.shape[0], -1)
 
-        probabilities = [self._probability_from_prediction(row) for row in predictions]
-        return np.asarray(probabilities, dtype=np.float32)
+        if predictions.size == 0:
+            return np.full((batch.shape[0],), 0.5, dtype=np.float32)
+
+        if predictions.shape[1] == 1:
+            values = predictions[:, 0].astype(np.float32)
+            if np.any((values < 0.0) | (values > 1.0)):
+                values = 1.0 / (1.0 + np.exp(-values))
+            return np.clip(values, 0.0, 1.0).astype(np.float32)
+
+        preds = predictions.astype(np.float32)
+        row_sums = np.sum(preds, axis=1)
+        is_prob_dist = bool(
+            np.all(np.isfinite(preds))
+            and np.all(preds >= 0.0)
+            and np.allclose(row_sums, 1.0, atol=1e-2)
+        )
+
+        if not is_prob_dist:
+            logits = preds - np.max(preds, axis=1, keepdims=True)
+            exp = np.exp(logits)
+            probs = exp / np.sum(exp, axis=1, keepdims=True)
+        else:
+            probs = preds
+
+        if probs.shape[1] >= 2:
+            values = probs[:, 1]
+        else:
+            values = np.max(probs, axis=1)
+
+        return np.clip(values, 0.0, 1.0).astype(np.float32)
 
     def _method_frame_budget(self, method: str) -> int:
         if method == "fast":
@@ -296,30 +304,7 @@ class InferenceService:
         return 40
 
     def _sample_video_frames(self, video_path: Path, max_frames: int) -> list[np.ndarray]:
-        capture = cv2.VideoCapture(str(video_path))
-        if not capture.isOpened():
-            raise ValueError(f"Unable to open video: {video_path}")
-
-        total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        sampled: list[np.ndarray] = []
-
-        if total_frames > 0:
-            indices = np.linspace(0, total_frames - 1, num=min(max_frames, total_frames), dtype=int)
-            for idx in indices:
-                capture.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-                ok, frame_bgr = capture.read()
-                if not ok or frame_bgr is None:
-                    continue
-                sampled.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-        else:
-            while len(sampled) < max_frames:
-                ok, frame_bgr = capture.read()
-                if not ok or frame_bgr is None:
-                    break
-                sampled.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-
-        capture.release()
-        return sampled
+        return extract_frames(video_path, max_frames=max_frames)
 
     @staticmethod
     def _largest_face_or_none(frame_rgb: np.ndarray) -> np.ndarray | None:
@@ -390,16 +375,20 @@ class InferenceService:
 
         tensors: list[np.ndarray] = []
         notes: list[str] = []
+        note_set: set[str] = set()
 
         for frame in frames:
             prepared, frame_notes = self._prepare_frame_by_method(frame, method)
-            notes.extend(frame_notes)
+            for note in frame_notes:
+                if note not in note_set:
+                    note_set.add(note)
+                    notes.append(note)
             tensors.append(self._prepare_tensor(prepared))
 
         batch = np.asarray(tensors, dtype=np.float32)
 
         probabilities: list[float] = []
-        chunk_size = 16
+        chunk_size = 32 if self.runtime_provider in {"CUDAExecutionProvider", "DmlExecutionProvider"} else 16
         for start_idx in range(0, len(batch), chunk_size):
             chunk = batch[start_idx : start_idx + chunk_size]
             probabilities.extend(self._predict_probabilities(chunk).tolist())

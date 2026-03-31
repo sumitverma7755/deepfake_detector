@@ -10,6 +10,8 @@ import cv2
 import numpy as np
 
 LOGGER = logging.getLogger(__name__)
+_FACE_DETECTOR_UNSET = object()
+_FACE_DETECTOR: cv2.CascadeClassifier | None | object = _FACE_DETECTOR_UNSET
 
 
 def load_image(image_path: str | Path) -> np.ndarray:
@@ -23,30 +25,58 @@ def load_image(image_path: str | Path) -> np.ndarray:
 
 def _get_opencv_face_detector() -> cv2.CascadeClassifier | None:
     """Return Haar-cascade detector if available."""
+    global _FACE_DETECTOR
+    if _FACE_DETECTOR is not _FACE_DETECTOR_UNSET:
+        return _FACE_DETECTOR  # type: ignore[return-value]
+
     cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
     if not cascade_path.exists():
         LOGGER.warning("OpenCV Haar cascade not found at %s", cascade_path)
+        _FACE_DETECTOR = None
         return None
 
     detector = cv2.CascadeClassifier(str(cascade_path))
     if detector.empty():
         LOGGER.warning("OpenCV face detector could not be initialized.")
+        _FACE_DETECTOR = None
         return None
+    _FACE_DETECTOR = detector
     return detector
 
 
-def extract_faces(image: np.ndarray, expand_ratio: float = 0.15) -> List[np.ndarray]:
+def extract_faces(
+    image: np.ndarray,
+    expand_ratio: float = 0.15,
+    detection_max_side: int = 960,
+) -> List[np.ndarray]:
     """Extract face crops from an RGB image using OpenCV Haar cascades."""
     detector = _get_opencv_face_detector()
     if detector is None:
         return []
 
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    detections = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+    detect_gray = gray
+    scale = 1.0
+    image_h, image_w = gray.shape[:2]
+    max_side = max(image_h, image_w)
+    if max_side > detection_max_side > 0:
+        scale = detection_max_side / float(max_side)
+        detect_gray = cv2.resize(
+            gray,
+            (max(1, int(image_w * scale)), max(1, int(image_h * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    detections = detector.detectMultiScale(detect_gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
 
     faces: List[np.ndarray] = []
-    image_h, image_w = image.shape[:2]
     for (x, y, w, h) in detections:
+        if scale != 1.0:
+            x = int(x / scale)
+            y = int(y / scale)
+            w = int(w / scale)
+            h = int(h / scale)
+
         dx = int(w * expand_ratio)
         dy = int(h * expand_ratio)
         x1 = max(0, x - dx)
@@ -61,6 +91,21 @@ def extract_faces(image: np.ndarray, expand_ratio: float = 0.15) -> List[np.ndar
     return faces
 
 
+def build_uniform_sample_indices(total_frames: int, max_frames: int) -> np.ndarray:
+    """Build evenly spaced frame indices without duplicates."""
+    if total_frames <= 0 or max_frames <= 0:
+        return np.empty((0,), dtype=np.int32)
+
+    sample_count = min(total_frames, max_frames)
+    if sample_count == 1:
+        return np.asarray([0], dtype=np.int32)
+
+    max_index = total_frames - 1
+    denominator = sample_count - 1
+    indices = [(i * max_index) // denominator for i in range(sample_count)]
+    return np.asarray(indices, dtype=np.int32)
+
+
 def extract_frames(video_path: str | Path, max_frames: int = 100) -> List[np.ndarray]:
     """Extract up to `max_frames` RGB frames from a video file."""
     video_path = str(video_path)
@@ -72,10 +117,13 @@ def extract_frames(video_path: str | Path, max_frames: int = 100) -> List[np.nda
     frames: List[np.ndarray] = []
 
     if frame_count > 0:
-        sample_count = min(max_frames, frame_count)
-        indices = np.linspace(0, frame_count - 1, sample_count, dtype=int)
+        indices = build_uniform_sample_indices(frame_count, max_frames)
         for idx in indices:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            current = int(capture.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+            skip = max(0, int(idx) - current)
+            for _ in range(skip):
+                if not capture.grab():
+                    break
             ok, frame_bgr = capture.read()
             if not ok or frame_bgr is None:
                 continue
